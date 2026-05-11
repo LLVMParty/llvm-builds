@@ -78,6 +78,8 @@ cmake -G Ninja -S "${SOURCE_DIR}/llvm" -B "${BUILD_DIR}/build" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="${INSTALL_DIR}" \
     -DCMAKE_OSX_DEPLOYMENT_TARGET="${MIN_MACOS}" \
+    -DLLVM_DEFAULT_TARGET_TRIPLE=arm64-apple-darwin \
+    -DLLVM_HOST_TRIPLE=arm64-apple-darwin \
     -DCMAKE_OSX_ARCHITECTURES=arm64 \
     -DLLVM_BUILD_LLVM_DYLIB=ON \
     -DLLVM_LINK_LLVM_DYLIB=ON \
@@ -95,6 +97,7 @@ cmake -G Ninja -S "${SOURCE_DIR}/llvm" -B "${BUILD_DIR}/build" \
     -DLLVM_INCLUDE_DOCS=OFF \
     -DLLVM_ENABLE_BINDINGS=OFF \
     -DLLVM_INSTALL_UTILS=ON \
+    -DLLVM_ENABLE_ZSTD=OFF \
     ${CMAKE_EXTRA_ARGS}
 
 echo "=== Building with ${PARALLEL_JOBS} compile jobs, 1 link job ==="
