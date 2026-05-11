@@ -108,18 +108,21 @@ RUN JOBS="${PARALLEL_JOBS:-$(nproc)}"; \
 
 # --- package --------------------------------------------------------------
 # Strip debug info to shrink the output significantly.
-RUN find /opt/llvm/lib -name '*.so*' -exec strip --strip-debug {} + 2>/dev/null; \
-    find /opt/llvm/lib -name '*.a'   -exec strip --strip-debug {} + 2>/dev/null; \
-    find /opt/llvm/bin -type f       -exec strip --strip-unneeded {} + 2>/dev/null; \
+RUN find /opt/llvm/lib -type f -name '*.so*' -exec strip --strip-debug {} + 2>/dev/null; \
+    find /opt/llvm/lib -type f -name '*.a'   -exec strip --strip-debug {} + 2>/dev/null; \
+    find /opt/llvm/bin -type f              -exec strip --strip-unneeded {} + 2>/dev/null; \
     true
 
 ARG ARCH=x86_64
 ARG LLVM_ENABLE_ASSERTIONS
+# -y preserves symlinks. Without it, Info-ZIP follows symlinks and stores
+# duplicate full copies for aliases like llvm-readelf -> llvm-readobj and
+# libLLVM.so -> libLLVM.so.21.1.
 RUN ASSERTIONS_SUFFIX=""; \
     [ "${LLVM_ENABLE_ASSERTIONS}" = "ON" ] && ASSERTIONS_SUFFIX="-assertions"; \
     mkdir -p /out \
-    && cd /opt \
-    && zip -qr /out/llvm-${LLVM_VERSION}-linux-${ARCH}${ASSERTIONS_SUFFIX}.zip llvm/
+    && cd /opt/llvm \
+    && zip -qr9y /out/llvm-${LLVM_VERSION}-linux-${ARCH}${ASSERTIONS_SUFFIX}.zip .
 
 # --- output stage ---------------------------------------------------------
 # "docker build --output" copies from this stage to the host.

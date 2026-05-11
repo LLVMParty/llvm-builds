@@ -176,12 +176,27 @@ set ASSERTIONS_SUFFIX=
 if "%LLVM_ENABLE_ASSERTIONS%"=="ON" set ASSERTIONS_SUFFIX=-assertions
 
 set ZIP_NAME=llvm-%LLVM_VERSION%-windows-%ARCH%%ASSERTIONS_SUFFIX%.zip
+if exist "%OUTPUT_DIR%\%ZIP_NAME%" del /f /q "%OUTPUT_DIR%\%ZIP_NAME%"
 
-pushd "%INSTALL_DIR%\.."
-powershell -NoProfile -Command "Compress-Archive -Path '%INSTALL_DIR%' -DestinationPath '%OUTPUT_DIR%\%ZIP_NAME%' -Force"
+set ZIP_EXE=
+for %%Z in (7z.exe 7zz.exe 7za.exe) do (
+    if not defined ZIP_EXE (
+        for /f "delims=" %%P in ('where %%Z 2^>nul') do (
+            if not defined ZIP_EXE set "ZIP_EXE=%%P"
+        )
+    )
+)
+
+pushd "%INSTALL_DIR%"
+if defined ZIP_EXE (
+    "%ZIP_EXE%" a -tzip -mx=9 "%OUTPUT_DIR%\%ZIP_NAME%" .\*
+) else (
+    powershell -NoProfile -Command "Compress-Archive -Path '.\*' -DestinationPath '%OUTPUT_DIR%\%ZIP_NAME%' -CompressionLevel Optimal -Force"
+)
+set PACKAGE_RESULT=!ERRORLEVEL!
 popd
 
-if errorlevel 1 (
+if not "%PACKAGE_RESULT%"=="0" (
     echo Error: Packaging failed.
     exit /b 1
 )

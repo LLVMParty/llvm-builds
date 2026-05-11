@@ -1,3 +1,4 @@
 dist/
 .llvm-build/
 .llvm-install/
+.DS_Store

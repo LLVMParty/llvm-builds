@@ -106,8 +106,12 @@ cmake --install "${BUILD_DIR}/build" --prefix "${INSTALL_DIR}"
 echo "=== Packaging ==="
 mkdir -p "${OUTPUT_DIR}"
 
-ZIP_NAME="llvm-${LLVM_VERSION}-macos-arm64.zip"
-(cd "${INSTALL_DIR}/.." && zip -qr "${OUTPUT_DIR}/${ZIP_NAME}" "$(basename "${INSTALL_DIR}")/")
+ASSERTIONS_SUFFIX=""
+[[ "${LLVM_ENABLE_ASSERTIONS}" == "ON" ]] && ASSERTIONS_SUFFIX="-assertions"
+ZIP_NAME="llvm-${LLVM_VERSION}-macos-arm64${ASSERTIONS_SUFFIX}.zip"
+rm -f "${OUTPUT_DIR}/${ZIP_NAME}"
+# -9 maximizes compression; -y preserves symlinks instead of duplicating targets.
+(cd "${INSTALL_DIR}" && zip -qr9y "${OUTPUT_DIR}/${ZIP_NAME}" .)
 
 echo ""
 echo "  ✓ ${OUTPUT_DIR}/${ZIP_NAME}"
