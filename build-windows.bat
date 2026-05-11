@@ -125,6 +125,8 @@ REM       C++ API consumers must link against the static libraries.
 
 echo === Configuring ===
 cmake -G Ninja -S "%SOURCE_DIR%\llvm" -B "%BUILD_DIR%\build" ^
+    -DCMAKE_C_COMPILER=clang-cl ^
+    -DCMAKE_CXX_COMPILER=clang-cl ^
     -DCMAKE_BUILD_TYPE=Release ^
     -DCMAKE_INSTALL_PREFIX="%INSTALL_DIR%" ^
     -DLLVM_BUILD_LLVM_C_DYLIB=ON ^
