@@ -109,9 +109,12 @@ RUN find /opt/llvm/lib -name '*.so*' -exec strip --strip-debug {} + 2>/dev/null;
     true
 
 ARG ARCH=x86_64
-RUN mkdir -p /out \
+ARG LLVM_ENABLE_ASSERTIONS
+RUN ASSERTIONS_SUFFIX=""; \
+    [ "${LLVM_ENABLE_ASSERTIONS}" = "ON" ] && ASSERTIONS_SUFFIX="-assertions"; \
+    mkdir -p /out \
     && cd /opt \
-    && zip -qr /out/llvm-${LLVM_VERSION}-linux-${ARCH}.zip llvm/
+    && zip -qr /out/llvm-${LLVM_VERSION}-linux-${ARCH}${ASSERTIONS_SUFFIX}.zip llvm/
 
 # --- output stage ---------------------------------------------------------
 # "docker build --output" copies from this stage to the host.

@@ -4,7 +4,7 @@
 #
 # Usage:
 #   ./build.sh                        # both arches, default LLVM version
-#   ./build.sh --version 21.1.0       # specific version
+#   ./build.sh --version 21.1.6       # specific version
 #   ./build.sh --arch x86_64          # single arch only
 #   ./build.sh --jobs 8               # override parallelism
 #   ./build.sh --assertions           # enable LLVM assertions (for development)
@@ -39,6 +39,9 @@ while [[ $# -gt 0 ]]; do
         *)            echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+ASSERTIONS_SUFFIX=""
+[[ "${LLVM_ENABLE_ASSERTIONS}" == "ON" ]] && ASSERTIONS_SUFFIX="-assertions"
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -87,7 +90,7 @@ for ARCH in "${ARCHES[@]}"; do
         .
 
     echo ""
-    echo "  ✓ ${OUTPUT_DIR}/llvm-${LLVM_VERSION}-linux-${ARCH}.zip"
+    echo "  ✓ ${OUTPUT_DIR}/llvm-${LLVM_VERSION}-linux-${ARCH}${ASSERTIONS_SUFFIX}.zip"
     echo ""
 done
 

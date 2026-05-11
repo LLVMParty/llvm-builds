@@ -170,7 +170,10 @@ REM --- Package ------------------------------------------------------------
 echo === Packaging ===
 if not exist "%OUTPUT_DIR%" mkdir "%OUTPUT_DIR%"
 
-set ZIP_NAME=llvm-%LLVM_VERSION%-windows-%ARCH%.zip
+set ASSERTIONS_SUFFIX=
+if "%LLVM_ENABLE_ASSERTIONS%"=="ON" set ASSERTIONS_SUFFIX=-assertions
+
+set ZIP_NAME=llvm-%LLVM_VERSION%-windows-%ARCH%%ASSERTIONS_SUFFIX%.zip
 
 pushd "%INSTALL_DIR%\.."
 powershell -NoProfile -Command "Compress-Archive -Path '%INSTALL_DIR%' -DestinationPath '%OUTPUT_DIR%\%ZIP_NAME%' -Force"
