@@ -86,6 +86,7 @@ cmake -G Ninja -S "${SOURCE_DIR}/llvm" -B "${BUILD_DIR}/build" \
     -DLLVM_ENABLE_EH=ON \
     -DLLVM_ENABLE_ASSERTIONS="${LLVM_ENABLE_ASSERTIONS}" \
     -DLLVM_ENABLE_DUMP="${LLVM_ENABLE_ASSERTIONS}" \
+    -DLLVM_ENABLE_PROJECTS="clang;lld" \
     -DLLVM_TARGETS_TO_BUILD=all \
     -DLLVM_ENABLE_LIBEDIT=OFF \
     -DLLVM_INCLUDE_TESTS=OFF \
@@ -93,7 +94,7 @@ cmake -G Ninja -S "${SOURCE_DIR}/llvm" -B "${BUILD_DIR}/build" \
     -DLLVM_INCLUDE_EXAMPLES=OFF \
     -DLLVM_INCLUDE_DOCS=OFF \
     -DLLVM_ENABLE_BINDINGS=OFF \
-    -DLLVM_INSTALL_UTILS=OFF \
+    -DLLVM_INSTALL_UTILS=ON \
     ${CMAKE_EXTRA_ARGS}
 
 echo "=== Building with ${PARALLEL_JOBS} compile jobs, 1 link job ==="
