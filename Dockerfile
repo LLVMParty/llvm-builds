@@ -40,15 +40,20 @@ ENV PATH="/opt/rh/gcc-toolset-12/root/usr/bin:${PATH}" \
 # The distro ninja (1.8.2 in manylinux_2_28) cannot read LLVM 21's
 # generated build.ninja because some depfile rules have multiple outputs.
 # Build a newer ninja before configuring LLVM.
+#
+# Do not build Ninja with its CMake/Makefile path here: Ninja's release CMake
+# enables IPO/LTO, and GCC's lto-wrapper uses Make's jobserver while linking.
+# Under Docker Desktop cross-arch/Rosetta this can fail with:
+#   make[3]: *** write jobserver: Bad file descriptor
+# The upstream bootstrap path builds only the ninja binary and avoids LTO/tests.
 ADD https://github.com/ninja-build/ninja/archive/refs/tags/v${NINJA_VERSION}.tar.gz \
     /tmp/ninja.tar.gz
 
 RUN mkdir -p /tmp/ninja \
     && tar xf /tmp/ninja.tar.gz -C /tmp/ninja --strip-components=1 \
-    && cmake -G "Unix Makefiles" -S /tmp/ninja -B /tmp/ninja/build \
-        -DCMAKE_BUILD_TYPE=Release \
-    && cmake --build /tmp/ninja/build --parallel "$(nproc)" \
-    && install -m 0755 /tmp/ninja/build/ninja /usr/local/bin/ninja \
+    && cd /tmp/ninja \
+    && python3 configure.py --bootstrap \
+    && install -m 0755 /tmp/ninja/ninja /usr/local/bin/ninja \
     && rm -rf /tmp/ninja /tmp/ninja.tar.gz \
     && ninja --version
 
