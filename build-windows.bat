@@ -9,6 +9,8 @@ REM   build-windows.bat
 REM   build-windows.bat --version 21.1.6
 REM   build-windows.bat --jobs 8
 REM   build-windows.bat --assertions
+REM   build-windows.bat --llvm-dll     (experimental LLVM_BUILD_LLVM_DYLIB equivalent)
+REM   set LLVM_BUILD_LLVM_DYLIB=ON && build-windows.bat
 REM
 REM Output: dist\llvm-<version>-windows-x86_64.zip
 REM
@@ -26,6 +28,7 @@ set PARALLEL_JOBS=%NUMBER_OF_PROCESSORS%
 set OUTPUT_DIR=%cd%\dist
 set CMAKE_EXTRA_ARGS=
 set LLVM_ENABLE_ASSERTIONS=OFF
+if not defined LLVM_BUILD_LLVM_DYLIB set LLVM_BUILD_LLVM_DYLIB=OFF
 set ARCH=x86_64
 
 :parse_args
@@ -35,6 +38,7 @@ if "%~1"=="--jobs"       ( set PARALLEL_JOBS=%~2& shift & shift & goto parse_arg
 if "%~1"=="--output"     ( set OUTPUT_DIR=%~2& shift & shift & goto parse_args )
 if "%~1"=="--cmake-args" ( set CMAKE_EXTRA_ARGS=%~2& shift & shift & goto parse_args )
 if "%~1"=="--assertions" ( set LLVM_ENABLE_ASSERTIONS=ON& shift & goto parse_args )
+if "%~1"=="--llvm-dll"   ( set LLVM_BUILD_LLVM_DYLIB=ON& shift & goto parse_args )
 echo Unknown option: %~1
 exit /b 1
 :done_args
@@ -42,6 +46,7 @@ exit /b 1
 echo === LLVM %LLVM_VERSION% ===
 echo === Architecture: %ARCH% ===
 echo === Assertions: %LLVM_ENABLE_ASSERTIONS% ===
+echo === LLVM.dll mode: %LLVM_BUILD_LLVM_DYLIB% ===
 echo === Parallel jobs: %PARALLEL_JOBS% ===
 echo.
 
@@ -78,6 +83,10 @@ where cmake >nul 2>&1 || (
 )
 where ninja >nul 2>&1 || (
     echo Error: ninja not found. Install via Visual Studio or https://ninja-build.org
+    exit /b 1
+)
+where python >nul 2>&1 || (
+    echo Error: python not found. Python 3.8+ is required for LLVM.dll mode and LLVM's build tools.
     exit /b 1
 )
 
@@ -119,9 +128,12 @@ if exist "%SOURCE_DIR%\llvm" (
 )
 
 REM --- Configure ----------------------------------------------------------
-REM Note: LLVM_BUILD_LLVM_DYLIB is not supported on Windows.
-REM       Use LLVM_BUILD_LLVM_C_DYLIB for the C API DLL (LLVM-C.dll).
-REM       C++ API consumers must link against the static libraries.
+REM LLVM_BUILD_LLVM_DYLIB is implemented externally by tools\llvm_dllify.py.
+REM In that mode, configure LLVM as a normal static MSVC build, build the
+REM a normal static MSVC build first, then replace the installed component
+REM libraries listed by LLVM's own libllvm-c.args with stub libraries that load
+REM LLVM.dll for downstream consumers.
+set LLVM_BUILD_LLVM_C_DYLIB=ON
 
 echo === Configuring ===
 cmake -G Ninja -S "%SOURCE_DIR%\llvm" -B "%BUILD_DIR%\build" ^
@@ -129,7 +141,7 @@ cmake -G Ninja -S "%SOURCE_DIR%\llvm" -B "%BUILD_DIR%\build" ^
     -DCMAKE_CXX_COMPILER=clang-cl ^
     -DCMAKE_BUILD_TYPE=Release ^
     -DCMAKE_INSTALL_PREFIX="%INSTALL_DIR%" ^
-    -DLLVM_BUILD_LLVM_C_DYLIB=ON ^
+    -DLLVM_BUILD_LLVM_C_DYLIB=%LLVM_BUILD_LLVM_C_DYLIB% ^
     -DLLVM_PARALLEL_LINK_JOBS=1 ^
     -DLLVM_ENABLE_RTTI=ON ^
     -DLLVM_ENABLE_EH=ON ^
@@ -162,6 +174,26 @@ if errorlevel 1 (
     exit /b 1
 )
 
+if "%LLVM_BUILD_LLVM_DYLIB%"=="ON" (
+    if not exist "%cd%\tools\llvm_dllify.py" (
+        echo Error: tools\llvm_dllify.py not found.
+        exit /b 1
+    )
+
+    echo === Generating LLVM.dll and component stub libraries ===
+    python "%cd%\tools\llvm_dllify.py" build ^
+        --libsfile "%BUILD_DIR%\build\libllvm-c.args" ^
+        --output-dir "%BUILD_DIR%\build" ^
+        --bin-dir "%BUILD_DIR%\build\bin" ^
+        --out-lib-dir "%BUILD_DIR%\build\lib" ^
+        --work-dir "%BUILD_DIR%\build\dllify-work" ^
+        --llvm-c-forwarder
+    if errorlevel 1 (
+        echo Error: llvm_dllify failed.
+        exit /b 1
+    )
+)
+
 REM --- Install ------------------------------------------------------------
 echo === Installing ===
 cmake --install "%BUILD_DIR%\build" --prefix "%INSTALL_DIR%"
@@ -170,14 +202,28 @@ if errorlevel 1 (
     exit /b 1
 )
 
+if "%LLVM_BUILD_LLVM_DYLIB%"=="ON" (
+    echo === Installing LLVM.dll artifacts ===
+    if not exist "%INSTALL_DIR%\bin" mkdir "%INSTALL_DIR%\bin"
+    if not exist "%INSTALL_DIR%\lib" mkdir "%INSTALL_DIR%\lib"
+    if not exist "%INSTALL_DIR%\share" mkdir "%INSTALL_DIR%\share"
+    copy /Y "%BUILD_DIR%\build\bin\LLVM.dll" "%INSTALL_DIR%\bin\LLVM.dll" >nul
+    copy /Y "%BUILD_DIR%\build\bin\LLVM-C.dll" "%INSTALL_DIR%\bin\LLVM-C.dll" >nul
+    copy /Y "%BUILD_DIR%\build\lib\LLVM.lib" "%INSTALL_DIR%\lib\LLVM.lib" >nul
+    copy /Y "%BUILD_DIR%\build\lib\LLVM-C.lib" "%INSTALL_DIR%\lib\LLVM-C.lib" >nul
+    if exist "%BUILD_DIR%\build\dllify-work\manifest.json" copy /Y "%BUILD_DIR%\build\dllify-work\manifest.json" "%INSTALL_DIR%\share\llvm-dllify-manifest.json" >nul
+)
+
 REM --- Package ------------------------------------------------------------
 echo === Packaging ===
 if not exist "%OUTPUT_DIR%" mkdir "%OUTPUT_DIR%"
 
 set ASSERTIONS_SUFFIX=
 if "%LLVM_ENABLE_ASSERTIONS%"=="ON" set ASSERTIONS_SUFFIX=-assertions
+set LLVM_DLL_SUFFIX=
+if "%LLVM_BUILD_LLVM_DYLIB%"=="ON" set LLVM_DLL_SUFFIX=-dll
 
-set ZIP_NAME=llvm-%LLVM_VERSION%-windows-%ARCH%%ASSERTIONS_SUFFIX%.zip
+set ZIP_NAME=llvm-%LLVM_VERSION%-windows-%ARCH%%ASSERTIONS_SUFFIX%%LLVM_DLL_SUFFIX%.zip
 if exist "%OUTPUT_DIR%\%ZIP_NAME%" del /f /q "%OUTPUT_DIR%\%ZIP_NAME%"
 
 set ZIP_EXE=
