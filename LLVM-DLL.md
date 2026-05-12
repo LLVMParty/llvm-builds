@@ -38,8 +38,8 @@ Linux                              Windows (our design)
 ─────                              ──────────────────────
 libLLVM-22.so                  →   LLVM.dll
 libclang-cpp.so                →   clang-cpp.dll (imports from LLVM.dll)
-libclang.so                    →   libclang.dll (forwarder, or keep as-is)
-libLTO.so                      →   (forwarder to LLVM.dll)
+libclang.so                    →   libclang.dll (imports clang-cpp.dll + LLVM.dll)
+libLTO.so                      →   LTO.dll (imports LLVM.dll)
 LLVM-C.dll                     →   (forwarder to LLVM.dll)
 ```
 
@@ -466,8 +466,8 @@ link.exe /DLL /DEF:clang-cpp.def /OUT:clang-cpp.dll ^
 #       ...
 link.exe /DLL /DEF:LLVM-C-fwd.def /OUT:LLVM-C.dll /NOENTRY
 
-# libclang.dll can remain as-is (it already works)
-# or become a forwarder to clang-cpp.dll
+# libclang.dll is relinked against clang-cpp.dll + LLVM.dll stubs.
+# LTO.dll is relinked against LLVM.dll stubs.
 ```
 
 ### 3.4 CMake Integration Points

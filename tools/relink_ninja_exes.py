@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Relink CMake/Ninja MSVC executable targets without rebuilding dependencies.
+"""Relink CMake/Ninja MSVC binary targets without rebuilding dependencies.
 
 LLVM.dll mode replaces static component libraries with DLL stub libraries after
 CMake has already generated the Ninja graph.  Running plain ``ninja`` after that
@@ -176,8 +176,8 @@ def relink_edge(
     if not rule:
         print(f"skip {edge.outputs[0]}: rule {edge.rule!r} not found", file=sys.stderr)
         return 0
-    if not edge.rule.startswith("CXX_EXECUTABLE_LINKER"):
-        print(f"skip {edge.outputs[0]}: not a CXX executable link rule ({edge.rule})")
+    if not edge.rule.startswith(("CXX_EXECUTABLE_LINKER", "CXX_SHARED_LIBRARY_LINKER")):
+        print(f"skip {edge.outputs[0]}: not a CXX executable/shared-library link rule ({edge.rule})")
         return 0
 
     variables: dict[str, str] = {}
@@ -277,7 +277,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--build-dir", required=True, help="CMake/Ninja build directory")
     parser.add_argument("--bin-dir", help="bin directory to scan with --all-bin-exes (default: BUILD_DIR/bin)")
     parser.add_argument("--all-bin-exes", action="store_true", help="relink every linked .exe in BUILD_DIR/bin")
-    parser.add_argument("--target", action="append", help="specific Ninja output to relink, e.g. bin/clang.exe")
+    parser.add_argument("--target", action="append", help="specific Ninja output to relink, e.g. bin/clang.exe or bin/libclang.dll")
     parser.add_argument("--exclude", action="append", help="basename glob to skip, e.g. *-tblgen.exe")
     parser.add_argument(
         "--msvc-noop-atexit",

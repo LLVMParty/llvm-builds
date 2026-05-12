@@ -239,6 +239,8 @@ if "%LLVM_BUILD_LLVM_DYLIB%"=="ON" (
         --build-dir "%BUILD_DIR%\build" ^
         --bin-dir "%BUILD_DIR%\build\bin" ^
         --all-bin-exes ^
+        --target "bin\libclang.dll" ^
+        --target "bin\LTO.dll" ^
         --msvc-noop-atexit "llvm-profgen.exe"
     if errorlevel 1 (
         echo Error: dynamic relink failed.
