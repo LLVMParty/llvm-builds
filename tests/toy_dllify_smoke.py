@@ -58,14 +58,14 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="dllify-toy-") as td:
         t = Path(td)
         (t / "toy.cpp").write_text(
-            "int global_value = 41;\n"
+            "extern \"C\" int global_value = 41;\n"
             "int add_one(int x) { return x + 1; }\n"
             "int read_global() { return global_value; }\n",
             encoding="utf-8",
         )
         (t / "use.cpp").write_text(
             "#include <stdio.h>\n"
-            "extern int global_value;\n"
+            "extern \"C\" int global_value;\n"
             "int add_one(int);\n"
             "int read_global();\n"
             "int main() {\n"

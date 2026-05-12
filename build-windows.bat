@@ -129,10 +129,9 @@ if exist "%SOURCE_DIR%\llvm" (
 
 REM --- Configure ----------------------------------------------------------
 REM LLVM_BUILD_LLVM_DYLIB is implemented externally by tools\llvm_dllify.py.
-REM In that mode, configure LLVM as a normal static MSVC build, build the
-REM a normal static MSVC build first, then replace the installed component
-REM libraries listed by LLVM's own libllvm-c.args with stub libraries that load
-REM LLVM.dll for downstream consumers.
+REM In that mode, build a normal static MSVC tree first, replace LLVM/Clang/LLD
+REM component libraries with DLL stubs, then relink tools against LLVM.dll,
+REM clang-cpp.dll, and lld.dll.
 set LLVM_BUILD_LLVM_C_DYLIB=ON
 
 echo === Configuring ===
@@ -183,13 +182,66 @@ if "%LLVM_BUILD_LLVM_DYLIB%"=="ON" (
     echo === Generating LLVM.dll and component stub libraries ===
     python "%cd%\tools\llvm_dllify.py" build ^
         --libsfile "%BUILD_DIR%\build\libllvm-c.args" ^
+        --exclude-lib LLVMTableGen.lib ^
         --output-dir "%BUILD_DIR%\build" ^
         --bin-dir "%BUILD_DIR%\build\bin" ^
         --out-lib-dir "%BUILD_DIR%\build\lib" ^
-        --work-dir "%BUILD_DIR%\build\dllify-work" ^
+        --work-dir "%BUILD_DIR%\build\dllify-work\LLVM" ^
         --llvm-c-forwarder
     if errorlevel 1 (
-        echo Error: llvm_dllify failed.
+        echo Error: llvm_dllify for LLVM failed.
+        exit /b 1
+    )
+
+    echo === Generating clang-cpp.dll and clang component stubs ===
+    python "%cd%\tools\llvm_dllify.py" build ^
+        --lib-dir "%BUILD_DIR%\build\lib" ^
+        --lib-prefix clang ^
+        --exclude-lib clang-repl.lib ^
+        --dll-name clang-cpp ^
+        --resolver-name __clang_resolve ^
+        --no-default-c-api-prefix ^
+        --c-api-prefix clang_ ^
+        --dependency-libsfile "%BUILD_DIR%\build\libllvm-c.args" ^
+        --dependency-lib "%BUILD_DIR%\build\lib\LLVM.lib" ^
+        --output-dir "%BUILD_DIR%\build" ^
+        --bin-dir "%BUILD_DIR%\build\bin" ^
+        --out-lib-dir "%BUILD_DIR%\build\lib" ^
+        --work-dir "%BUILD_DIR%\build\dllify-work\clang-cpp"
+    if errorlevel 1 (
+        echo Error: llvm_dllify for clang-cpp failed.
+        exit /b 1
+    )
+
+    echo === Generating lld.dll and lld component stubs ===
+    python "%cd%\tools\llvm_dllify.py" build ^
+        --lib-dir "%BUILD_DIR%\build\lib" ^
+        --lib-prefix lld ^
+        --dll-name lld ^
+        --resolver-name __lld_resolve ^
+        --no-default-c-api-prefix ^
+        --dependency-libsfile "%BUILD_DIR%\build\libllvm-c.args" ^
+        --dependency-lib "%BUILD_DIR%\build\lib\LLVM.lib" ^
+        --output-dir "%BUILD_DIR%\build" ^
+        --bin-dir "%BUILD_DIR%\build\bin" ^
+        --out-lib-dir "%BUILD_DIR%\build\lib" ^
+        --work-dir "%BUILD_DIR%\build\dllify-work\lld"
+    if errorlevel 1 (
+        echo Error: llvm_dllify for lld failed.
+        exit /b 1
+    )
+
+    echo === Relinking tools against LLVM.dll/clang-cpp.dll/lld.dll stubs ===
+    REM llvm-profgen needs a no-op atexit shim: the normal MSVC CRT atexit
+    REM registration crashes before main() after dynamic relinking, and LLVM
+    REM tools do not require process-exit destructors for correctness.
+    python "%cd%\tools\relink_ninja_exes.py" ^
+        --build-dir "%BUILD_DIR%\build" ^
+        --bin-dir "%BUILD_DIR%\build\bin" ^
+        --all-bin-exes ^
+        --msvc-noop-atexit "llvm-profgen.exe"
+    if errorlevel 1 (
+        echo Error: dynamic relink failed.
         exit /b 1
     )
 )
@@ -209,9 +261,15 @@ if "%LLVM_BUILD_LLVM_DYLIB%"=="ON" (
     if not exist "%INSTALL_DIR%\share" mkdir "%INSTALL_DIR%\share"
     copy /Y "%BUILD_DIR%\build\bin\LLVM.dll" "%INSTALL_DIR%\bin\LLVM.dll" >nul
     copy /Y "%BUILD_DIR%\build\bin\LLVM-C.dll" "%INSTALL_DIR%\bin\LLVM-C.dll" >nul
+    copy /Y "%BUILD_DIR%\build\bin\clang-cpp.dll" "%INSTALL_DIR%\bin\clang-cpp.dll" >nul
+    copy /Y "%BUILD_DIR%\build\bin\lld.dll" "%INSTALL_DIR%\bin\lld.dll" >nul
     copy /Y "%BUILD_DIR%\build\lib\LLVM.lib" "%INSTALL_DIR%\lib\LLVM.lib" >nul
     copy /Y "%BUILD_DIR%\build\lib\LLVM-C.lib" "%INSTALL_DIR%\lib\LLVM-C.lib" >nul
-    if exist "%BUILD_DIR%\build\dllify-work\manifest.json" copy /Y "%BUILD_DIR%\build\dllify-work\manifest.json" "%INSTALL_DIR%\share\llvm-dllify-manifest.json" >nul
+    copy /Y "%BUILD_DIR%\build\lib\clang-cpp.lib" "%INSTALL_DIR%\lib\clang-cpp.lib" >nul
+    copy /Y "%BUILD_DIR%\build\lib\lld.lib" "%INSTALL_DIR%\lib\lld.lib" >nul
+    if exist "%BUILD_DIR%\build\dllify-work\LLVM\manifest.json" copy /Y "%BUILD_DIR%\build\dllify-work\LLVM\manifest.json" "%INSTALL_DIR%\share\llvm-dllify-manifest.json" >nul
+    if exist "%BUILD_DIR%\build\dllify-work\clang-cpp\manifest.json" copy /Y "%BUILD_DIR%\build\dllify-work\clang-cpp\manifest.json" "%INSTALL_DIR%\share\clang-cpp-dllify-manifest.json" >nul
+    if exist "%BUILD_DIR%\build\dllify-work\lld\manifest.json" copy /Y "%BUILD_DIR%\build\dllify-work\lld\manifest.json" "%INSTALL_DIR%\share\lld-dllify-manifest.json" >nul
 )
 
 REM --- Package ------------------------------------------------------------

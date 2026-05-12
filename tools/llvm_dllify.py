@@ -51,6 +51,7 @@ TEXT_CHARS = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ | I
 TEXT_COMDAT_CHARS = TEXT_CHARS | IMAGE_SCN_LNK_COMDAT
 RDATA_CHARS = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_ALIGN_16BYTES
 DATA_CHARS = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE | IMAGE_SCN_ALIGN_8BYTES
+DATA_COMDAT_CHARS = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE | IMAGE_SCN_ALIGN_16BYTES | IMAGE_SCN_LNK_COMDAT
 CRT_CHARS = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_ALIGN_8BYTES
 DRECTVE_CHARS = IMAGE_SCN_LNK_INFO | IMAGE_SCN_LNK_REMOVE | IMAGE_SCN_ALIGN_1BYTES
 
@@ -130,11 +131,10 @@ def dedupe_paths(paths: Iterable[Path]) -> list[Path]:
     return out
 
 
-def is_c_api_symbol(name: str) -> bool:
-    # On x64 Windows C exports are undecorated.  Keep the predicate deliberately
-    # narrow for LLVM.dll; clang_* is used when the same machinery is reused for
-    # clang-cpp.dll/libclang work later.
-    return not name.startswith("?") and (name.startswith("LLVM") or name.startswith("clang_"))
+def is_c_api_symbol(name: str, prefixes: Sequence[str]) -> bool:
+    # On x64 Windows C exports are undecorated.  Prefixes are per partition:
+    # LLVM uses LLVM*, clang-cpp/libclang uses clang_*, and lld has no C API.
+    return not name.startswith("?") and any(name.startswith(prefix) for prefix in prefixes)
 
 
 def is_exportable_data_symbol(name: str) -> bool:
@@ -154,7 +154,7 @@ def is_exportable_data_symbol(name: str) -> bool:
         return False
     if name in {"@feat.00", "@comp.id"}:
         return False
-    if name.startswith("??_7") or name.startswith("??_R"):
+    if name.startswith(("??_7", "??_8", "??_R")):
         return True
     if name.startswith("?"):
         # Static data members and other MSVC-decorated data.  Exclude dynamic
@@ -163,18 +163,39 @@ def is_exportable_data_symbol(name: str) -> bool:
         if name.startswith("??__"):
             return False
         return True
-    if name.startswith(("_CT", "_CTA", "_TI", "_CTA", "_Catchable", "_TypeDescriptor")):
+    if name.startswith(("_CT", "_CTA", "_TI", "_Catchable", "_TypeDescriptor")):
         return True
     # LLVM has a small number of unmangled globals (for example target module
     # anchors) that are real data definitions.
     return True
 
 
-def fnv1a32(name: str) -> int:
-    h = 0x811C9DC5
+def is_copyable_data_symbol(name: str, type_code: str) -> bool:
+    """Whether a proxy data symbol should be initialized from the DLL.
+
+    The proxy definition itself is needed to satisfy non-dllimport data
+    relocations in existing MSVC objects.  Copying is only safe for immutable
+    ABI data (RTTI/vtables/read-only constants).  Mutable globals such as
+    cl::opt instances, ManagedStatic state, registries, and pass IDs must not be
+    byte-copied from the DLL: their internal pointers refer to the DLL's own
+    object and lead to crashes/hangs during tool startup.
+    """
+    if not name.startswith("?"):
+        return True
+    if "@@3PEB" in name or "@@3QEB" in name:
+        # MSVC-mangled constant pointer data (for example clang-format's
+        # const char * style descriptions) is commonly emitted as writable data
+        # because it needs a relocation.  Copying the pointer value is safe and
+        # avoids zero-initialized proxy pointers in option constructors.
+        return True
+    return False
+
+
+def fnv1a64(name: str) -> int:
+    h = 0xCBF29CE484222325
     for b in name.encode("utf-8"):
         h ^= b
-        h = (h * 0x01000193) & 0xFFFFFFFF
+        h = (h * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
     return h
 
 
@@ -236,7 +257,7 @@ def extract_symbols_from_lib(nm: str, lib: Path) -> dict[str, str]:
     return symbols
 
 
-def build_inventory(nm: str, libs: Sequence[Path], *, compute_data_sizes: bool = False) -> SymbolInventory:
+def build_inventory(nm: str, libs: Sequence[Path], *, compute_data_sizes: bool = False, c_api_prefixes: Sequence[str] = ("LLVM",)) -> SymbolInventory:
     per_lib: dict[str, dict[str, str]] = {}
     owners: dict[str, str] = {}
     raw_type_counts: Counter[str] = Counter()
@@ -256,11 +277,11 @@ def build_inventory(nm: str, libs: Sequence[Path], *, compute_data_sizes: bool =
         typ = per_lib[owner][name]
         upper = typ.upper()
         if upper == "T":
-            if is_c_api_symbol(name):
+            if is_c_api_symbol(name, c_api_prefixes):
                 c_api.add(name)
             else:
                 functions.add(name)
-        elif is_c_api_symbol(name):
+        elif is_c_api_symbol(name, c_api_prefixes):
             # Defensive: LLVM C API should be code, but exporting it by name is
             # still the desired ABI if a tool reports an unusual code.
             c_api.add(name)
@@ -424,10 +445,10 @@ def collect_data_symbol_sizes(libs: Sequence[Path], owners: dict[str, str], data
 def verify_hashes(symbols: Iterable[str]) -> dict[int, str]:
     seen: dict[int, str] = {}
     for sym in symbols:
-        h = fnv1a32(sym)
+        h = fnv1a64(sym)
         other = seen.get(h)
         if other is not None and other != sym:
-            die(f"FNV-1a 32-bit collision: {other!r} and {sym!r} -> 0x{h:08x}")
+            die(f"FNV-1a 64-bit collision: {other!r} and {sym!r} -> 0x{h:016x}")
         seen[h] = sym
     return seen
 
@@ -619,43 +640,33 @@ def pad_to(f, offset: int) -> None:
         f.write(b"\0" * (offset - pos))
 
 
-def make_resolver_source(path: Path) -> None:
+def make_resolver_source(path: Path, resolver_name: str, table_name: str, count_name: str) -> None:
     path.write_text(
-        r'''#include <stdint.h>
-#include <stddef.h>
-
-struct SymEntry {
-  uint32_t hash;
-  uintptr_t addr;
-};
-
-extern const struct SymEntry __llvm_symtab[];
-extern const uint32_t __llvm_symtab_count;
-
-#ifdef _MSC_VER
-__declspec(dllexport)
-#endif
-void *__cdecl __llvm_resolve(uint32_t hash) {
-  uint32_t lo = 0;
-  uint32_t hi = __llvm_symtab_count;
-  while (lo < hi) {
-    uint32_t mid = lo + ((hi - lo) >> 1);
-    if (__llvm_symtab[mid].hash < hash)
-      lo = mid + 1;
-    else
-      hi = mid;
-  }
-  if (lo < __llvm_symtab_count && __llvm_symtab[lo].hash == hash)
-    return (void *)__llvm_symtab[lo].addr;
-  return (void *)0;
-}
-''',
+        f'''#include <stdint.h>\n#include <stddef.h>\n\n'''
+        f'''struct SymEntry {{\n  uint64_t hash;\n  uintptr_t addr;\n}};\n\n'''
+        f'''extern const struct SymEntry {table_name}[];\n'''
+        f'''extern const uint32_t {count_name};\n\n'''
+        f'''#ifdef _MSC_VER\n__declspec(dllexport)\n#endif\n'''
+        f'''void *__cdecl {resolver_name}(uint64_t hash) {{\n'''
+        f'''  uint32_t lo = 0;\n'''
+        f'''  uint32_t hi = {count_name};\n'''
+        f'''  while (lo < hi) {{\n'''
+        f'''    uint32_t mid = lo + ((hi - lo) >> 1);\n'''
+        f'''    if ({table_name}[mid].hash < hash)\n'''
+        f'''      lo = mid + 1;\n'''
+        f'''    else\n'''
+        f'''      hi = mid;\n'''
+        f'''  }}\n'''
+        f'''  if (lo < {count_name} && {table_name}[lo].hash == hash)\n'''
+        f'''    return (void *){table_name}[lo].addr;\n'''
+        f'''  return (void *)0;\n'''
+        f'''}}\n''',
         encoding="utf-8",
     )
 
 
-def make_symtab_obj(path: Path, functions: Sequence[str]) -> None:
-    entries = sorted((fnv1a32(sym), sym) for sym in functions)
+def make_symtab_obj(path: Path, functions: Sequence[str], table_name: str, count_name: str) -> None:
+    entries = sorted((fnv1a64(sym), sym) for sym in functions)
     coff = CoffObject()
     chunk_size = 60000
     first_section: int | None = None
@@ -665,16 +676,16 @@ def make_symtab_obj(path: Path, functions: Sequence[str]) -> None:
         sec_no = coff.add_section(f".rdata${suffix}", RDATA_CHARS)
         if first_section is None:
             first_section = sec_no
-            coff.define("__llvm_symtab", sec_no, 0, external=True, function=False)
+            coff.define(table_name, sec_no, 0, external=True, function=False)
         sec = coff.section(sec_no)
         for h, sym in chunk:
             off = len(sec.data)
-            sec.data.extend(struct.pack("<IIQ", h, 0, 0))
+            sec.data.extend(struct.pack("<QQ", h, 0))
             coff.extern(sym, function=True)
             coff.add_reloc(sec_no, off + 8, sym, IMAGE_REL_AMD64_ADDR64)
 
     count_sec = coff.add_section(".rdata$Z", RDATA_CHARS)
-    coff.define("__llvm_symtab_count", count_sec, 0, external=True, function=False)
+    coff.define(count_name, count_sec, 0, external=True, function=False)
     coff.section(count_sec).data.extend(struct.pack("<I", len(entries)))
     coff.write(path)
 
@@ -685,6 +696,13 @@ def append_rel32_call(coff: CoffObject, sec_no: int, target: str) -> None:
     sec.data.extend(b"\xE8\x00\x00\x00\x00")  # call rel32
     coff.extern(target, function=True)
     coff.add_reloc(sec_no, off + 1, target, IMAGE_REL_AMD64_REL32)
+
+
+def append_rip_load_rax(coff: CoffObject, sec_no: int, target: str) -> None:
+    sec = coff.section(sec_no)
+    off = len(sec.data)
+    sec.data.extend(b"\x48\x8B\x05\x00\x00\x00\x00")  # mov rax, qword ptr [rip+rel32]
+    coff.add_reloc(sec_no, off + 3, target, IMAGE_REL_AMD64_REL32)
 
 
 def append_rip_store_rax(coff: CoffObject, sec_no: int, target: str) -> None:
@@ -703,12 +721,9 @@ def append_rip_jmp(coff: CoffObject, sec_no: int, target: str) -> None:
 
 def make_stub_obj(path: Path, lib_stem: str, functions: Sequence[str], resolver_helper_name: str) -> None:
     coff = CoffObject()
-    init_text = coff.add_section(".text", TEXT_CHARS)
     data = coff.add_section(".data", DATA_CHARS)
-    crt = coff.add_section(".CRT$XCU", CRT_CHARS)
 
     safe_stem = ''.join(ch if ch.isalnum() else '_' for ch in lib_stem)
-    init_name = f"__llvm_dllify_init_{safe_stem}"
     slot_names: list[tuple[str, str, int]] = []
 
     data_sec = coff.section(data)
@@ -717,48 +732,55 @@ def make_stub_obj(path: Path, lib_stem: str, functions: Sequence[str], resolver_
         slot_off = len(data_sec.data)
         data_sec.data.extend(b"\0" * 8)
         coff.define(slot, data, slot_off, external=False, function=False)
-        slot_names.append((sym, slot, fnv1a32(sym)))
-
+        slot_names.append((sym, slot, fnv1a64(sym)))
     # Put every thunk in its own pick-any COMDAT section.  MSVC/clang-cl emit
     # many inline/template functions as COMDATs in consumers; making thunks
     # COMDAT too lets the linker discard duplicate local inline copies instead
     # of failing with duplicate-symbol errors when a component stub object is
-    # extracted.
-    for sym, slot, _h in slot_names:
+    # extracted.  Thunks resolve lazily on first call, preserving the Windows x64
+    # argument registers while calling the resolver helper.
+    for sym, slot, h in slot_names:
         thunk_text = coff.add_section(".text$mn", TEXT_COMDAT_CHARS)
-        append_rip_jmp(coff, thunk_text, slot)
+        sec = coff.section(thunk_text)
+        append_rip_load_rax(coff, thunk_text, slot)
+        sec.data.extend(b"\x48\x85\xC0")          # test rax, rax
+        sec.data.extend(b"\x74\x02")              # je slow_path (skip jmp rax)
+        sec.data.extend(b"\xFF\xE0")              # jmp rax
+        sec.data.extend(b"\x48\x81\xEC\xA8\x00\x00\x00")  # sub rsp, 168; align + shadow
+        sec.data.extend(b"\x48\x89\x4C\x24\x20")  # mov [rsp+0x20], rcx
+        sec.data.extend(b"\x48\x89\x54\x24\x28")  # mov [rsp+0x28], rdx
+        sec.data.extend(b"\x4C\x89\x44\x24\x30")  # mov [rsp+0x30], r8
+        sec.data.extend(b"\x4C\x89\x4C\x24\x38")  # mov [rsp+0x38], r9
+        sec.data.extend(b"\xF3\x0F\x7F\x44\x24\x40")  # movdqu [rsp+0x40], xmm0
+        sec.data.extend(b"\xF3\x0F\x7F\x4C\x24\x50")  # movdqu [rsp+0x50], xmm1
+        sec.data.extend(b"\xF3\x0F\x7F\x54\x24\x60")  # movdqu [rsp+0x60], xmm2
+        sec.data.extend(b"\xF3\x0F\x7F\x5C\x24\x70")  # movdqu [rsp+0x70], xmm3
+        sec.data.extend(b"\x48\xB9" + struct.pack("<Q", h))  # mov rcx, imm64
+        append_rel32_call(coff, thunk_text, resolver_helper_name)
+        append_rip_store_rax(coff, thunk_text, slot)
+        sec.data.extend(b"\x49\x89\xC3")          # mov r11, rax
+        sec.data.extend(b"\xF3\x0F\x6F\x44\x24\x40")  # movdqu xmm0, [rsp+0x40]
+        sec.data.extend(b"\xF3\x0F\x6F\x4C\x24\x50")  # movdqu xmm1, [rsp+0x50]
+        sec.data.extend(b"\xF3\x0F\x6F\x54\x24\x60")  # movdqu xmm2, [rsp+0x60]
+        sec.data.extend(b"\xF3\x0F\x6F\x5C\x24\x70")  # movdqu xmm3, [rsp+0x70]
+        sec.data.extend(b"\x4C\x8B\x4C\x24\x38")  # mov r9, [rsp+0x38]
+        sec.data.extend(b"\x4C\x8B\x44\x24\x30")  # mov r8, [rsp+0x30]
+        sec.data.extend(b"\x48\x8B\x54\x24\x28")  # mov rdx, [rsp+0x28]
+        sec.data.extend(b"\x48\x8B\x4C\x24\x20")  # mov rcx, [rsp+0x20]
+        sec.data.extend(b"\x48\x81\xC4\xA8\x00\x00\x00")  # add rsp, 168
+        sec.data.extend(b"\x41\xFF\xE3")          # jmp r11
         coff.define_comdat_section_symbol(thunk_text, selection=2)
         coff.define(sym, thunk_text, 0, external=True, function=True)
 
-    text_sec = coff.section(init_text)
-    init_off = len(text_sec.data)
-    coff.define(init_name, init_text, init_off, external=False, function=True)
-    # Windows x64 ABI: reserve 32-byte shadow space and keep stack 16-byte aligned.
-    text_sec.data.extend(b"\x48\x83\xEC\x28")  # sub rsp, 40
-    for _sym, slot, h in slot_names:
-        text_sec.data.extend(b"\xB9" + struct.pack("<I", h))  # mov ecx, imm32
-        append_rel32_call(coff, init_text, resolver_helper_name)
-        append_rip_store_rax(coff, init_text, slot)
-    text_sec.data.extend(b"\x48\x83\xC4\x28\xC3")  # add rsp, 40; ret
-
-    crt_sec = coff.section(crt)
-    crt_sec.data.extend(b"\0" * 8)
-    coff.add_reloc(crt, 0, init_name, IMAGE_REL_AMD64_ADDR64)
     coff.write(path)
 
 
-def make_resolve_helper_source(path: Path, helper_name: str) -> None:
+def make_resolve_helper_source(path: Path, helper_name: str, resolver_name: str) -> None:
     path.write_text(
-        f'''#include <stdint.h>\n#include <windows.h>\n\n'''
-        f'''typedef void *(__cdecl *__llvm_dllify_resolver_t)(uint32_t);\n\n'''
-        f'''void *__cdecl {helper_name}(uint32_t hash) {{\n'''
-        f'''  static __llvm_dllify_resolver_t resolver;\n'''
-        f'''  if (!resolver) {{\n'''
-        f'''    HMODULE h = GetModuleHandleA("LLVM.dll");\n'''
-        f'''    if (!h) h = LoadLibraryA("LLVM.dll");\n'''
-        f'''    if (h) resolver = (__llvm_dllify_resolver_t)GetProcAddress(h, "__llvm_resolve");\n'''
-        f'''  }}\n'''
-        f'''  return resolver ? resolver(hash) : (void *)0;\n'''
+        f'''#include <stdint.h>\n\n'''
+        f'''__declspec(dllimport) void *__cdecl {resolver_name}(uint64_t hash);\n\n'''
+        f'''void *__cdecl {helper_name}(uint64_t hash) {{\n'''
+        f'''  return {resolver_name}(hash);\n'''
         f'''}}\n''',
         encoding="utf-8",
     )
@@ -772,7 +794,7 @@ def make_dummy_obj(path: Path) -> None:
     coff.write(path)
 
 
-def make_data_proxy_obj(path: Path, lib_stem: str, data_sizes: dict[str, int]) -> tuple[str, str, str]:
+def make_data_proxy_obj(path: Path, lib_stem: str, data_sizes: dict[str, int], copy_symbols: set[str]) -> tuple[str, str, str]:
     """Create a COFF object defining local mirrors for exported DLL data.
 
     MSVC import libraries cannot transparently satisfy non-dllimport data
@@ -781,7 +803,6 @@ def make_data_proxy_obj(path: Path, lib_stem: str, data_sizes: dict[str, int]) -
     bytes from LLVM.dll into each proxy before main().
     """
     coff = CoffObject()
-    data_sec_no = coff.add_section(".data", DATA_CHARS)
     rdata_sec_no = coff.add_section(".rdata", RDATA_CHARS)
     safe_stem = ''.join(ch if ch.isalnum() else '_' for ch in lib_stem)
     table_name = f"__llvm_dllify_data_entries_{safe_stem}"
@@ -794,17 +815,17 @@ def make_data_proxy_obj(path: Path, lib_stem: str, data_sizes: dict[str, int]) -
     drectve = coff.add_section(".drectve", DRECTVE_CHARS)
     coff.section(drectve).data.extend(f" /include:{anchor_name}".encode("ascii"))
 
-    data_sec = coff.section(data_sec_no)
     for sym, size in sorted(data_sizes.items()):
-        while len(data_sec.data) % 16:
-            data_sec.data.append(0)
-        off = len(data_sec.data)
-        coff.define(sym, data_sec_no, off, external=True, function=False)
+        data_sec_no = coff.add_section(".data$D", DATA_COMDAT_CHARS)
+        data_sec = coff.section(data_sec_no)
         data_sec.data.extend(b"\0" * max(1, size))
+        coff.define_comdat_section_symbol(data_sec_no, selection=2)
+        coff.define(sym, data_sec_no, 0, external=True, function=False)
 
     rdata_sec = coff.section(rdata_sec_no)
     string_labels: dict[str, str] = {}
-    for i, sym in enumerate(sorted(data_sizes)):
+    copy_items = {sym: data_sizes[sym] for sym in copy_symbols if sym in data_sizes}
+    for i, sym in enumerate(sorted(copy_items)):
         label = f"$llvmdll_name${safe_stem}${i:08x}"
         while len(rdata_sec.data) % 1:
             rdata_sec.data.append(0)
@@ -815,7 +836,7 @@ def make_data_proxy_obj(path: Path, lib_stem: str, data_sizes: dict[str, int]) -
     while len(rdata_sec.data) % 8:
         rdata_sec.data.append(0)
     coff.define(table_name, rdata_sec_no, len(rdata_sec.data), external=True, function=False)
-    for sym, size in sorted(data_sizes.items()):
+    for sym, size in sorted(copy_items.items()):
         off = len(rdata_sec.data)
         rdata_sec.data.extend(struct.pack("<QQII", 0, 0, max(1, size), 0))
         coff.add_reloc(rdata_sec_no, off, sym, IMAGE_REL_AMD64_ADDR64)
@@ -824,12 +845,12 @@ def make_data_proxy_obj(path: Path, lib_stem: str, data_sizes: dict[str, int]) -
     while len(rdata_sec.data) % 4:
         rdata_sec.data.append(0)
     coff.define(count_name, rdata_sec_no, len(rdata_sec.data), external=True, function=False)
-    rdata_sec.data.extend(struct.pack("<I", len(data_sizes)))
+    rdata_sec.data.extend(struct.pack("<I", len(copy_items)))
     coff.write(path)
     return table_name, count_name, anchor_name
 
 
-def make_data_helper_source(path: Path, table_name: str, count_name: str, anchor_name: str) -> None:
+def make_data_helper_source(path: Path, table_name: str, count_name: str, anchor_name: str, dll_filename: str) -> None:
     path.write_text(
         f'''#include <stdint.h>\n#include <string.h>\n#include <windows.h>\n\n'''
         f'''struct __llvm_dllify_data_entry {{\n  void *dst;\n  const char *name;\n  uint32_t size;\n  uint32_t reserved;\n}};\n\n'''
@@ -838,17 +859,25 @@ def make_data_helper_source(path: Path, table_name: str, count_name: str, anchor
         f'''static void __cdecl __llvm_dllify_copy_data(void);\n'''
         f'''void *{anchor_name} = (void *)&__llvm_dllify_copy_data;\n\n'''
         f'''static void __cdecl __llvm_dllify_copy_data(void) {{\n'''
-        f'''  HMODULE h = GetModuleHandleA("LLVM.dll");\n'''
-        f'''  if (!h) h = LoadLibraryA("LLVM.dll");\n'''
+        f'''  HMODULE h = GetModuleHandleA("{dll_filename}");\n'''
+        f'''  if (!h) h = LoadLibraryA("{dll_filename}");\n'''
         f'''  if (!h) return;\n'''
         f'''  for (uint32_t i = 0; i < {count_name}; ++i) {{\n'''
         f'''    const struct __llvm_dllify_data_entry *e = &{table_name}[i];\n'''
         f'''    void *src = (void *)GetProcAddress(h, e->name);\n'''
-        f'''    if (src) memcpy(e->dst, src, e->size);\n'''
+        f'''    if (!src) continue;\n'''
+        f'''    MEMORY_BASIC_INFORMATION mbi;\n'''
+        f'''    if (VirtualQuery(e->dst, &mbi, sizeof(mbi)) == sizeof(mbi)) {{\n'''
+        f'''      DWORD protect = mbi.Protect & 0xff;\n'''
+        f'''      if (protect != PAGE_READWRITE && protect != PAGE_WRITECOPY &&\n'''
+        f'''          protect != PAGE_EXECUTE_READWRITE && protect != PAGE_EXECUTE_WRITECOPY)\n'''
+        f'''        continue;\n'''
+        f'''    }}\n'''
+        f'''    memcpy(e->dst, src, e->size);\n'''
         f'''  }}\n'''
         f'''}}\n\n'''
-        f'''#pragma section(".CRT$XCU", read)\n'''
-        f'''__declspec(allocate(".CRT$XCU"))\n'''
+        f'''#pragma section(".CRT$XCT", read)\n'''
+        f'''__declspec(allocate(".CRT$XCT"))\n'''
         f'''static void (__cdecl *__llvm_dllify_copy_data_init)(void) = __llvm_dllify_copy_data;\n''',
         encoding="utf-8",
     )
@@ -866,6 +895,10 @@ def write_def(path: Path, dll_name: str, c_api: Sequence[str], data: Sequence[st
     for sym in sorted(data):
         lines.append(f"    {sym} DATA")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_resolver_import_def(path: Path, dll_name: str, resolver_name: str) -> None:
+    path.write_text(f"LIBRARY {dll_name}\nEXPORTS\n    {resolver_name}\n", encoding="utf-8")
 
 
 def write_forwarder_def(path: Path, dll_name: str, target_dll: str, exports: Sequence[str]) -> None:
@@ -918,6 +951,12 @@ def link_dll(
     run([linker, f"@{rsp}"])
 
 
+def make_import_lib(lib_tool: str, out_lib: Path, def_file: Path) -> None:
+    if out_lib.exists():
+        out_lib.unlink()
+    run([lib_tool, "/NOLOGO", "/MACHINE:X64", f"/DEF:{def_file}", f"/OUT:{out_lib}"], quiet=True)
+
+
 def make_lib(lib_tool: str, out_lib: Path, members: Sequence[Path]) -> None:
     if out_lib.exists():
         out_lib.unlink()
@@ -927,10 +966,10 @@ def make_lib(lib_tool: str, out_lib: Path, members: Sequence[Path]) -> None:
     run([lib_tool, f"@{rsp}"], quiet=True)
 
 
-def owner_functions_for_lib(inventory: SymbolInventory, lib_name: str) -> list[str]:
+def owner_symbols_for_lib(inventory: SymbolInventory, lib_name: str, wanted: set[str]) -> list[str]:
     out: list[str] = []
     for sym, typ in inventory.per_lib.get(lib_name, {}).items():
-        if inventory.owners.get(sym) == lib_name and sym in inventory.functions:
+        if inventory.owners.get(sym) == lib_name and sym in wanted:
             out.append(sym)
     return sorted(out)
 
@@ -946,46 +985,56 @@ def default_system_libs() -> list[str]:
         "ws2_32.lib",
         "ntdll.lib",
         "delayimp.lib",
+        "version.lib",
         "/delayload:shell32.dll",
         "/delayload:ole32.dll",
     ]
 
 
-def write_manifest(path: Path, inventory: SymbolInventory, libs: Sequence[Path], outputs: dict[str, str]) -> None:
+def write_manifest(path: Path, inventory: SymbolInventory, libs: Sequence[Path], outputs: dict[str, str], *, dll_filename: str, resolver_name: str) -> None:
     data = inventory.manifest()
     data.update({
         "input_libraries": [str(p) for p in libs],
         "outputs": outputs,
-        "hash": "fnv1a32",
+        "hash": "fnv1a64",
         "arch": "x86_64-pc-windows-msvc",
         "notes": [
-            "Non-C API functions are resolved through __llvm_resolve(hash).",
+            f"Non-C API functions are resolved through {resolver_name}(hash).",
             "C API functions and selected data symbols are real PE exports.",
-            "Component .lib files contain owner-only thunks/data proxies and load LLVM.dll directly; consumers keep linking LLVMCore/LLVMIRReader/etc.",
+            f"Component .lib files contain owner-only thunks/data proxies and load {dll_filename}; consumers keep linking the usual component libraries.",
         ],
     })
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def c_api_prefixes_from_args(args: argparse.Namespace) -> list[str]:
+    if args.no_default_c_api_prefix:
+        return list(args.c_api_prefix or [])
+    return list(args.c_api_prefix or ["LLVM"])
+
+
 def command_census(args: argparse.Namespace) -> None:
     libs = discover_libs(args)
     nm = find_vs_tool(["llvm-nm.exe", "llvm-nm"], args.nm)
-    inventory = build_inventory(nm, libs)
-    verify_hashes(inventory.functions)
+    inventory = build_inventory(nm, libs, c_api_prefixes=c_api_prefixes_from_args(args))
+    verify_hashes(inventory.functions | inventory.c_api)
     print(json.dumps(inventory.manifest(), indent=2, sort_keys=True))
 
 
 def discover_libs(args: argparse.Namespace) -> list[Path]:
+    excludes = set(args.exclude_lib or [])
+    excludes.update({f"{args.dll_name}.lib", "LLVM-C.lib"})
     if args.libsfile:
-        libs = read_libsfile(Path(args.libsfile))
+        libs = [p for p in read_libsfile(Path(args.libsfile)) if p.name not in excludes]
     elif args.lib_dir:
         lib_dir = Path(args.lib_dir)
+        prefix = args.lib_prefix
         # pathlib's Windows globbing is case-insensitive, so filter the basename
         # explicitly.  Lowercase llvm-*.lib files are import libraries for tools
         # such as llvm-jitlink-executor.exe, not LLVM component archives.
         libs = sorted(
             p for p in lib_dir.glob("*.lib")
-            if p.name.startswith("LLVM") and p.name not in {"LLVM.lib", "LLVM-C.lib"}
+            if p.name.startswith(prefix) and p.name not in excludes and "-" not in p.stem
         )
     else:
         die("pass --libsfile or --lib-dir")
@@ -994,6 +1043,10 @@ def discover_libs(args: argparse.Namespace) -> list[Path]:
     if missing:
         die("missing input libraries:\n  " + "\n  ".join(missing[:20]))
     return libs
+
+
+def c_identifier_from_name(name: str) -> str:
+    return ''.join(ch if ch.isalnum() else '_' for ch in name)
 
 
 def command_build(args: argparse.Namespace) -> None:
@@ -1011,85 +1064,124 @@ def command_build(args: argparse.Namespace) -> None:
     lib_dir.mkdir(parents=True, exist_ok=True)
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"=== inventorying {len(libs)} LLVM libraries ===")
-    inventory = build_inventory(nm, libs, compute_data_sizes=True)
-    verify_hashes(inventory.functions)
+    dll_name = args.dll_name
+    dll_filename = dll_name if dll_name.lower().endswith(".dll") else f"{dll_name}.dll"
+    dll_stem = dll_filename[:-4] if dll_filename.lower().endswith(".dll") else dll_filename
+    safe_dll = c_identifier_from_name(dll_stem)
+    resolver_name = args.resolver_name or f"__{safe_dll.lower()}_resolve"
+    table_name = f"__{safe_dll.lower()}_symtab"
+    count_name = f"__{safe_dll.lower()}_symtab_count"
+    c_api_prefixes = c_api_prefixes_from_args(args)
+    dependency_libs: list[Path] = []
+    if args.dependency_libsfile:
+        dependency_libs.extend(read_libsfile(Path(args.dependency_libsfile)))
+    if args.dependency_lib:
+        dependency_libs.extend(Path(p) for p in args.dependency_lib)
+    dependency_libs = dedupe_paths(dependency_libs)
+
+    print(f"=== inventorying {len(libs)} {dll_stem} libraries ===")
+    inventory = build_inventory(nm, libs, compute_data_sizes=True, c_api_prefixes=c_api_prefixes)
+    verify_hashes(inventory.functions | inventory.c_api)
     manifest = inventory.manifest()
     print(json.dumps(manifest, indent=2, sort_keys=True))
     if manifest["total_named_exports"] >= 65535:
         die(f"PE named export count would be {manifest['total_named_exports']}, exceeding the 65,535 limit")
 
-    print("=== generating LLVM.dll resolver objects ===")
-    resolver_c = work_dir / "llvm_resolver.c"
-    resolver_obj = work_dir / "llvm_resolver.obj"
-    symtab_obj = work_dir / "llvm_symtab.obj"
-    llvm_def = work_dir / "LLVM.def"
-    make_resolver_source(resolver_c)
+    print(f"=== generating {dll_filename} resolver objects ===")
+    resolver_c = work_dir / f"{safe_dll}_resolver.c"
+    resolver_obj = work_dir / f"{safe_dll}_resolver.obj"
+    symtab_obj = work_dir / f"{safe_dll}_symtab.obj"
+    dll_def = work_dir / f"{dll_stem}.def"
+    make_resolver_source(resolver_c, resolver_name, table_name, count_name)
     compile_resolver(cl, resolver_c, resolver_obj)
-    make_symtab_obj(symtab_obj, sorted(inventory.functions))
-    write_def(llvm_def, "LLVM", sorted(inventory.c_api), sorted(inventory.data))
+    make_symtab_obj(symtab_obj, sorted(inventory.functions | inventory.c_api), table_name, count_name)
+    write_def(dll_def, dll_stem, sorted(inventory.c_api), sorted(inventory.data), resolver_name)
 
-    out_dll = bin_dir / "LLVM.dll"
-    import_lib = lib_dir / "LLVM.lib"
-    print("=== linking LLVM.dll ===")
+    out_dll = bin_dir / dll_filename
+    import_lib = lib_dir / f"{dll_stem}.lib"
+    print(f"=== linking {dll_filename} ===")
     link_dll(
         linker,
         out_dll,
         import_lib,
-        llvm_def,
+        dll_def,
         [resolver_obj, symtab_obj],
         libs,
-        args.extra_link_lib or default_system_libs(),
+        [str(p) for p in dependency_libs] + (args.extra_link_lib or default_system_libs()),
         work_dir,
         whole_archive=True,
     )
+
+    resolver_import_def = work_dir / f"{safe_dll}Resolve.def"
+    resolver_import_lib = work_dir / f"{safe_dll}Resolve.lib"
+    write_resolver_import_def(resolver_import_def, dll_stem, resolver_name)
+    make_import_lib(lib_tool, resolver_import_lib, resolver_import_def)
 
     print("=== generating component stub libraries ===")
     stub_count = 0
     thunk_count = 0
     data_proxy_count = 0
     data_proxy_bytes = 0
+    data_copy_count = 0
     for lib in libs:
-        funcs = owner_functions_for_lib(inventory, lib.name)
+        funcs = owner_symbols_for_lib(inventory, lib.name, inventory.functions)
+        c_api_funcs = owner_symbols_for_lib(inventory, lib.name, inventory.c_api)
         owned_data = {
             sym: inventory.data_sizes.get(sym, 8)
             for sym in inventory.per_lib.get(lib.name, {})
             if inventory.owners.get(sym) == lib.name and sym in inventory.data
         }
         members: list[Path] = []
-        if funcs:
-            obj = work_dir / f"{lib.stem}.stubs.obj"
+        if funcs or c_api_funcs:
             helper_c = work_dir / f"{lib.stem}.resolve_helper.c"
             helper_obj = work_dir / f"{lib.stem}.resolve_helper.obj"
             safe_stem = ''.join(ch if ch.isalnum() else '_' for ch in lib.stem)
-            helper_name = f"__llvm_dllify_resolve_{safe_stem}"
-            make_stub_obj(obj, lib.stem, funcs, helper_name)
-            make_resolve_helper_source(helper_c, helper_name)
+            helper_name = f"__{safe_dll.lower()}_dllify_resolve_{safe_stem}"
+            make_resolve_helper_source(helper_c, helper_name, resolver_name)
             compile_c(cl, helper_c, helper_obj)
-            members.extend([obj, helper_obj])
-            stub_count += 1
-            thunk_count += len(funcs)
+            members.append(helper_obj)
+            members.append(resolver_import_lib)
+            if funcs:
+                obj = work_dir / f"{lib.stem}.stubs.obj"
+                make_stub_obj(obj, lib.stem, funcs, helper_name)
+                members.append(obj)
+                stub_count += 1
+                thunk_count += len(funcs)
+            if c_api_funcs:
+                obj = work_dir / f"{lib.stem}.c_api_stubs.obj"
+                make_stub_obj(obj, f"{lib.stem}.c_api", c_api_funcs, helper_name)
+                members.append(obj)
+                stub_count += 1
+                thunk_count += len(c_api_funcs)
         if owned_data:
             data_obj = work_dir / f"{lib.stem}.data.obj"
             helper_c = work_dir / f"{lib.stem}.data_init.c"
             helper_obj = work_dir / f"{lib.stem}.data_init.obj"
-            table_name, count_name, anchor_name = make_data_proxy_obj(data_obj, lib.stem, owned_data)
-            make_data_helper_source(helper_c, table_name, count_name, anchor_name)
+            copy_symbols = {
+                sym for sym in owned_data
+                if is_copyable_data_symbol(sym, inventory.per_lib.get(lib.name, {}).get(sym, ""))
+            }
+            table_name, count_name, anchor_name = make_data_proxy_obj(data_obj, lib.stem, owned_data, copy_symbols)
+            make_data_helper_source(helper_c, table_name, count_name, anchor_name, dll_filename)
             compile_c(cl, helper_c, helper_obj)
             members.extend([data_obj, helper_obj])
             data_proxy_count += len(owned_data)
             data_proxy_bytes += sum(max(1, size) for size in owned_data.values())
+            data_copy_count += len(copy_symbols)
         if not members:
             empty_obj = work_dir / f"{lib.stem}.empty.obj"
             make_dummy_obj(empty_obj)
             members.append(empty_obj)
         # Existing LLVMCore/LLVMIRReader/etc. libraries remain the public link
-        # surface; users do not need to link a combined LLVM.lib.  The thunk and
-        # data helpers load LLVM.dll and resolve __llvm_resolve with Win32 APIs.
+        # surface; users do not need to link a combined LLVM.lib.  Function
+        # thunk helpers import only __llvm_resolve from LLVM.dll, keeping each
+        # component stub small while making LLVM.dll a real PE dependency.
         make_lib(lib_tool, lib_dir / lib.name, members)
 
     forwarder = None
     if args.llvm_c_forwarder:
+        if dll_stem != "LLVM":
+            die("--llvm-c-forwarder is only valid with --dll-name LLVM")
         exports = sorted(sym for sym in inventory.c_api if sym.startswith("LLVM"))
         fwd_def = work_dir / "LLVM-C.forwarder.def"
         fwd_dll = bin_dir / "LLVM-C.dll"
@@ -1107,8 +1199,8 @@ def command_build(args: argparse.Namespace) -> None:
         forwarder = str(fwd_dll)
 
     outputs = {
-        "LLVM.dll": str(out_dll),
-        "LLVM.lib": str(import_lib),
+        dll_filename: str(out_dll),
+        f"{dll_stem}.lib": str(import_lib),
         "stub_library_dir": str(lib_dir),
         "work_dir": str(work_dir),
         "component_stub_libraries": str(len(libs)),
@@ -1116,10 +1208,11 @@ def command_build(args: argparse.Namespace) -> None:
         "component_thunks": str(thunk_count),
         "data_proxy_symbols": str(data_proxy_count),
         "data_proxy_bytes": str(data_proxy_bytes),
+        "data_copy_symbols": str(data_copy_count),
     }
     if forwarder:
         outputs["LLVM-C.dll"] = forwarder
-    write_manifest(work_dir / "manifest.json", inventory, libs, outputs)
+    write_manifest(work_dir / "manifest.json", inventory, libs, outputs, dll_filename=dll_filename, resolver_name=resolver_name)
     print("=== done ===")
     print(json.dumps(outputs, indent=2, sort_keys=True))
 
@@ -1129,8 +1222,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     def add_common(sp: argparse.ArgumentParser) -> None:
-        sp.add_argument("--libsfile", help="newline-separated list of LLVM component .lib files (for example build/libllvm-c.args)")
-        sp.add_argument("--lib-dir", help="directory containing LLVM*.lib files; used if --libsfile is omitted")
+        sp.add_argument("--libsfile", help="newline-separated list of component .lib files (for example build/libllvm-c.args)")
+        sp.add_argument("--lib-dir", help="directory containing component .lib files; used if --libsfile is omitted")
+        sp.add_argument("--lib-prefix", default="LLVM", help="component library basename prefix used with --lib-dir (default: LLVM)")
+        sp.add_argument("--exclude-lib", action="append", help="library basename to exclude when using --lib-dir")
+        sp.add_argument("--dll-name", default="LLVM", help="DLL/import-library stem to generate (default: LLVM)")
+        sp.add_argument("--c-api-prefix", action="append", help="undecorated C API export prefix; pass none with --no-default-c-api-prefix")
+        sp.add_argument("--no-default-c-api-prefix", action="store_true", help="clear the default LLVM C API prefix")
         sp.add_argument("--nm", help="path to llvm-nm.exe")
 
     c = sub.add_parser("census", help="inventory symbols and verify hash collisions")
@@ -1146,7 +1244,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     b.add_argument("--cl", help="path to cl.exe")
     b.add_argument("--link", help="path to lld-link.exe or link.exe")
     b.add_argument("--lib-tool", help="path to lib.exe or llvm-lib.exe")
-    b.add_argument("--extra-link-lib", action="append", help="additional linker input for LLVM.dll; if omitted, LLVM's standard Windows system libs are used")
+    b.add_argument("--resolver-name", help="exported resolver function name (default: derived from --dll-name)")
+    b.add_argument("--dependency-libsfile", help="newline-separated dependency .lib files to link into the DLL without /WHOLEARCHIVE")
+    b.add_argument("--dependency-lib", action="append", help="additional dependency .lib file to link into the DLL without /WHOLEARCHIVE")
+    b.add_argument("--extra-link-lib", action="append", help="additional linker input for the DLL; if omitted, LLVM's standard Windows system libs are used")
     b.add_argument("--llvm-c-forwarder", action="store_true", help="also emit LLVM-C.dll as a forwarder to LLVM.dll")
     b.set_defaults(func=command_build)
     return p
