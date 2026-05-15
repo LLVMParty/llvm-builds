@@ -1,7 +1,8 @@
 dist/
-.llvm-build/
-.llvm-install/
+.llvm-build*/
+.llvm-install*/
 .llvm-dll-test*/
 .llvm-dll-test*.log
 .DS_Store
 __pycache__/
+tmp*
